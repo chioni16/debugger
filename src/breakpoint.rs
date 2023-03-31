@@ -53,3 +53,10 @@ impl Breakpoint {
         self.inst_addr
     }
 }
+
+pub enum BreakpointLaterAction {
+    Nothing,
+    Disable, 
+    Enable, 
+    Delete,
+}

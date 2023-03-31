@@ -5,25 +5,26 @@ use gimli::{Dwarf, EndianSlice, RunTimeEndian, read::{Unit, UnitOffset, Debuggin
 use object::{Object, ObjectSection};
 use anyhow::Result;
 
-#[allow(unused)]
-pub fn runner() {
-    let path = "target/test";
-    let bin = std::fs::read(path).unwrap();
-    let object = object::File::parse(&*bin).unwrap();
-    let endian = if object.is_little_endian() {
-        gimli::RunTimeEndian::Little
-    } else {
-        gimli::RunTimeEndian::Big
-    };
-    let dwarf = load_dwarf(&object, endian).unwrap();
-    let (unit, offset) = get_function_from_pc(&dwarf, 0x1150).unwrap().unwrap();
-    let entry = unit.entry(offset).unwrap();
-    println!("<{:x}> {}", entry.offset().0, entry.tag());
-    print_die_attrs(&entry).unwrap();
-    println!("line entry from pc: {:x?}", get_line_entry_from_pc(&dwarf, 0x1150).unwrap());
-}
+// #[allow(unused)]
+// pub fn runner() {
+//     let path = "target/test";
+//     let bin = std::fs::read(path).unwrap();
+//     let object = object::File::parse(&*bin).unwrap();
+//     let endian = if object.is_little_endian() {
+//         gimli::RunTimeEndian::Little
+//     } else {
+//         gimli::RunTimeEndian::Big
+//     };
+//     let dwarf = load_dwarf(&object, endian).unwrap();
+//     let (unit, offset) = get_function_from_pc(&dwarf, 0x1150).unwrap().unwrap();
+//     let entry = unit.entry(offset).unwrap();
+//     println!("<{:x}> {}", entry.offset().0, entry.tag());
+//     print_die_attrs(&entry).unwrap();
+//     println!("line entry from pc: {:x?}", get_line_entry_from_pc(&dwarf, 0x1150).unwrap());
+// }
 
 pub(crate) fn load_dwarf<'o>(object: &'o object::File<'o>, endian: gimli::RunTimeEndian) -> Result<Dwarf<EndianSlice<'o, RunTimeEndian>>, gimli::Error> {
+// pub(crate) fn load_dwarf<'o, R: gimli::Reader>(object: &'o object::File<'o>, endian: gimli::RunTimeEndian) -> Result<Dwarf<impl gimli::Reader + 'o>, gimli::Error> {
     let load_section = |id: gimli::SectionId| -> Result<gimli::EndianSlice<RunTimeEndian>, gimli::Error> {
         match object.section_by_name(id.name()) {
             Some(ref section) => {
@@ -41,96 +42,91 @@ pub(crate) fn load_dwarf<'o>(object: &'o object::File<'o>, endian: gimli::RunTim
         }
     };
 
-    gimli::Dwarf::load(&load_section)
+    let d = gimli::Dwarf::load(&load_section)?;
+    Ok(d)
 }
 
-#[allow(unused_variables)]
-pub fn get_function_from_pc<R>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(Unit<R, <R as gimli::Reader>::Offset>, UnitOffset<<R as gimli::Reader>::Offset>)>>
-    where R: gimli::Reader,
-          <R as gimli::Reader>::Offset: std::fmt::LowerHex
-{
-    let unit = get_compile_unit_for_pc(dwarf, pc)?.unwrap();
-    let mut depth = 0; 
+// pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(Unit<R, <R as gimli::Reader>::Offset>, UnitOffset<<R as gimli::Reader>::Offset>)>> {
+// pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(Unit<R>, UnitOffset<<R as gimli::Reader>::Offset>)>> {
+pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<()>> {
+    if let Some(unit) = get_compile_unit_for_pc(dwarf, pc)? {
+        let mut depth = 0; 
 
-    let mut entries = unit.entries();
-    while let Some((delta_depth, entry)) = entries.next_dfs()? {
-        depth += delta_depth;
-        if matches!(entry.tag(), gimli::DW_TAG_subprogram) && get_die_addr_range(entry)?.contains(&pc) { 
-            let offset =  entry.offset().to_owned();
-            return Ok(Some((unit, offset)))
+        let mut entries = unit.entries();
+        while let Some((delta_depth, entry)) = entries.next_dfs()? {
+            depth += delta_depth;
+            if matches!(entry.tag(), gimli::DW_TAG_subprogram) && get_die_addr_range(entry)?.contains(&pc) { 
+                let offset =  entry.offset().to_owned();
+                // return Ok(Some((unit, offset)))
+                return Ok(Some(()))
+            }
         }
     }
 
     Ok(None)
 }
 
-pub fn get_line_entry_from_pc<R>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(PathBuf, usize, usize)>>
-    where R: gimli::Reader,
-          <R as gimli::Reader>::Offset: std::fmt::LowerHex
-{
-    let unit = get_compile_unit_for_pc(dwarf, pc)?.unwrap();
-
-    let comp_dir = if let Some(ref dir) = unit.comp_dir {
-        path::PathBuf::from(dir.to_string_lossy()?.into_owned())
-    } else {
-        path::PathBuf::new()
-    };
-
-    let program = unit.line_program.clone().unwrap();
-    let mut rows = program.rows();
-
+pub fn get_line_entry_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<LineEntry>> {
     let mut value = None;
-    while let Some((header, row)) = rows.next_row()? && row.address() < pc{
-        // Determine the path. Real applications should cache this for performance.
-        let mut path = path::PathBuf::new();
-        if let Some(file) = row.file(header) {
-            path = comp_dir.clone();
 
-            // The directory index 0 is defined to correspond to the compilation unit directory.
-            if file.directory_index() != 0 {
-                if let Some(dir) = file.directory(header) {
-                    path.push(
-                        dwarf.attr_string(&unit, dir)?.to_string_lossy()?.as_ref(),
-                    );
+    if let Some(unit) = get_compile_unit_for_pc(dwarf, pc)? 
+    && let Some(program) = unit.line_program.clone()
+    {
+        let comp_dir = if let Some(ref dir) = unit.comp_dir {
+            path::PathBuf::from(dir.to_string_lossy()?.into_owned())
+        } else {
+            path::PathBuf::new()
+        };
+
+        let mut rows = program.rows();
+        while let Some((header, row)) = rows.next_row()? && row.address() < pc{
+            // Determine the path. Real applications should cache this for performance.
+            let mut path = path::PathBuf::new();
+            if let Some(file) = row.file(header) {
+                path = comp_dir.clone();
+
+                // The directory index 0 is defined to correspond to the compilation unit directory.
+                if file.directory_index() != 0 {
+                    if let Some(dir) = file.directory(header) {
+                        path.push(
+                            dwarf.attr_string(&unit, dir)?.to_string_lossy()?.as_ref(),
+                        );
+                    }
                 }
+
+                path.push(
+                    dwarf
+                        .attr_string(&unit, file.path_name())?
+                        .to_string_lossy()?
+                        .as_ref(),
+                );
             }
 
-            path.push(
-                dwarf
-                    .attr_string(&unit, file.path_name())?
-                    .to_string_lossy()?
-                    .as_ref(),
-            );
+            // Determine line/column. DWARF line/column is never 0, so we use that
+            // but other applications may want to display this differently.
+            let line = match row.line() {
+                Some(line) => line.get(),
+                None => 0,
+            } as usize;
+            let col = match row.column() {
+                gimli::ColumnType::LeftEdge => 0,
+                gimli::ColumnType::Column(column) => column.get(),
+            } as usize;
+
+            value = Some(LineEntry {
+                path, 
+                line, 
+                col,
+            });
         }
-
-        // Determine line/column. DWARF line/column is never 0, so we use that
-        // but other applications may want to display this differently.
-        let line = match row.line() {
-            Some(line) => line.get(),
-            None => 0,
-        } as usize;
-        let column = match row.column() {
-            gimli::ColumnType::LeftEdge => 0,
-            gimli::ColumnType::Column(column) => column.get(),
-        } as usize;
-
-        // println!("{:x} {}:{}:{}", row.address(), path.display(), line, column);
-        value = Some((path, line, column));
     }
 
     Ok(value)
 }
 
-pub fn get_compile_unit_for_pc<'d, R>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<gimli::Unit<R>>>
-    where R: gimli::Reader,
-          <R as gimli::Reader>::Offset: std::fmt::LowerHex
-{
+pub fn get_compile_unit_for_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<gimli::Unit<R>>> {
     let mut iter = dwarf.units();
     while let Some(header) = iter.next()? {
-        // println!(
-        //     "Unit at <.debug_info+0x{:x}>",
-        //     header.offset().as_debug_info_offset().unwrap().0
-        // );
         let unit = dwarf.unit(header)?;
         let mut entries = unit.entries();
 
@@ -156,4 +152,11 @@ fn print_die_attrs<R: gimli::Reader>(entry: &DebuggingInformationEntry<R>) -> Re
         println!("   {}: {:x?}", attr.name(), attr.value());
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct LineEntry {
+    pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
 }

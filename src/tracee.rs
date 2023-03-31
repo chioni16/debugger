@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gimli::{Dwarf, EndianSlice, RunTimeEndian};
+use gimli::{Dwarf, EndianSlice, RunTimeEndian, Unit, UnitOffset};
 use nix::sys::{wait, ptrace, signal::Signal, personality};
 use nix::errno::Errno;
 use object::Object;
@@ -38,15 +38,15 @@ impl Tracee {
             });
         }
 
-        let child = cmd.spawn().unwrap();
+        let child = cmd.spawn()?;
         let pid = nix::unistd::Pid::from_raw(child.id() as _);
 
         // It should be okay to use `leak` here as we want the binary data to be present 
         // for the rest of the program
         // so no need to clean it up either
-        let bin = std::fs::read(path).unwrap().leak();
+        let bin = std::fs::read(path)?.leak();
 
-        let elf = object::File::parse(&*bin).unwrap();
+        let elf = object::File::parse(&*bin)?;
         let endian = if elf.is_little_endian() {
             gimli::RunTimeEndian::Little
         } else {
@@ -96,7 +96,7 @@ impl Tracee {
                 let pc = registers::get_reg_value(self.pid, registers::Register::Rip)? - 1;
                 registers::set_reg_value(self.pid, registers::Register::Rip, pc)?;
                 eprintln!("Hit breakpoint at address {:#x}", pc);
-                self.print_source(pc)?;
+                // self.print_source(pc)?;
             }
             // TRAP_TRACE	2	/* process trace trap */
             0x2 => eprintln!("Received TRAP_TRACE"),
@@ -110,21 +110,51 @@ impl Tracee {
         Ok(())
     }
 
-    fn load_dwarf(&self) -> Result<Dwarf<EndianSlice<RunTimeEndian>>, gimli::Error> {
-        crate::dwarf::load_dwarf(&self.elf, self.endian)
+    pub fn read_mem(&self, addr: u64) -> Result<i64> {
+        let val = ptrace::read(self.pid, addr as ptrace::AddressType)?;
+        Ok(val)
+    }
+    
+    pub fn write_mem(&self, addr: u64, val: u64) -> Result<()> {
+        unsafe { ptrace::write(self.pid, addr as ptrace::AddressType, val as ptrace::AddressType)?; }
+        Ok(())
+    }
+
+    pub fn single_step_instr(&self) -> Result<()> {
+        ptrace::step(self.pid, None)?;
+        self.wait_for_signal()?;
+        Ok(())
     }
 
     fn offset_load_addr(&self, addr: u64) -> u64 {
         addr - self.start_load_addr
     }
 
-    fn print_source(&self, pc: u64) -> Result<()> {
-        let offset_pc = self.offset_load_addr(pc);
-        if let Some((path, line, _col)) = crate::dwarf::get_line_entry_from_pc(&self.load_dwarf()?, offset_pc)? {
-            util::print_source(path.display().to_string(), line, 2)
+    pub fn print_source(&self) -> Result<()> {
+        if let Some(le) = self.get_line_entry()? {
+            util::print_source(le.path.display().to_string(), le.line, 2)
         } else {
             eprintln!("No source found");
             Ok(())
         }
+    }
+
+    fn load_dwarf(&self) -> Result<Dwarf<EndianSlice<RunTimeEndian>>, gimli::Error> {
+        crate::dwarf::load_dwarf(&self.elf, self.endian)
+    }
+
+    pub fn get_line_entry(&self) -> Result<Option<crate::dwarf::LineEntry>>  {
+        let pc = registers::get_reg_value(self.pid, registers::Register::Rip)?;
+        let offset_pc = self.offset_load_addr(pc);
+        println!("pc: {:#x}", offset_pc);
+        crate::dwarf::get_line_entry_from_pc(&self.load_dwarf()?, offset_pc)
+    }
+
+    // pub fn get_func<R: gimli::Reader>(&self) -> Result<Option<(Unit<R, <R as gimli::Reader>::Offset>, UnitOffset<<R as gimli::Reader>::Offset>)>>  {
+    pub fn get_func<R: gimli::Reader>(&self) -> Result<Option<(Unit<R>, UnitOffset<<R as gimli::Reader>::Offset>)>>  {
+        let pc = registers::get_reg_value(self.pid, registers::Register::Rip)?;
+        let offset_pc = self.offset_load_addr(pc);
+        let d: Dwarf<EndianSlice<RunTimeEndian>> = crate::dwarf::load_dwarf(&self.elf, self.endian)?;
+        crate::dwarf::get_function_from_pc(&d, offset_pc)
     }
 }

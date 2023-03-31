@@ -3,7 +3,13 @@ use nix::sys::ptrace;
 use std::io::{stdin, Read};
 use std::collections::HashMap;
 
-use crate::{breakpoint::Breakpoint, registers, tracee::Tracee, util};
+use crate::dwarf;
+use crate::{
+    breakpoint::{Breakpoint, BreakpointLaterAction}, 
+    registers, 
+    tracee::Tracee, 
+    util,
+};
 
 pub struct Debugger {
     tracee: Tracee,
@@ -34,10 +40,10 @@ impl Debugger {
                     let addr = addr + self.tracee.start_load_addr;
                     self.set_breakpoint_at(addr as ptrace::AddressType)?;
                 }
-                "c" | "cont" | "continue" => {
-                    self.step_over_breakpoint()?;
-                    ptrace::cont(self.tracee.pid, None)?;
-                    if self.tracee.wait_for_signal()? { break }
+                "c" | "cont" | "continue" => if self.continue_execution()? { break },
+                "si" | "stepi" => {
+                    self.single_step_instr_with_breakpoint_check()?;
+                    self.tracee.print_source()?;
                 }
                 "r" | "reg" | "registers" => {
                     let sc = split.next().ok_or(anyhow!("No subcommand provided"))?;
@@ -65,12 +71,14 @@ impl Debugger {
                     let addr = util::parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
                     match sc {
                         "r" | "read" => {
-                            let val = ptrace::read(self.tracee.pid, addr as ptrace::AddressType)?;
+                            let val = self.tracee.read_mem(addr)?;
+                            // ptrace::read(self.tracee.pid, addr as ptrace::AddressType)?;
                             println!("{:#x}", val);
                         }
                         "w" | "write" => {
                             let val = util::parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?;
-                            unsafe { ptrace::write(self.tracee.pid, addr as ptrace::AddressType, val as ptrace::AddressType)?; }
+                            self.tracee.write_mem(addr, val)?;
+                            // unsafe { ptrace::write(self.tracee.pid, addr as ptrace::AddressType, val as ptrace::AddressType)?; }
                         }
                         _ => return Err(anyhow!("Unknown subcommand: {}", sc)),
                     }
@@ -93,18 +101,96 @@ impl Debugger {
         Ok(())
     }
 
-    fn step_over_breakpoint(&mut self) -> Result<()> {
+    fn step_over_breakpoint(&mut self) -> Result<bool> {
+        let mut bp_present = false;
         // let pc = registers::get_reg_value(self.pid, registers::Register::Rip)? - 1;
         let pc = registers::get_reg_value(self.tracee.pid, registers::Register::Rip)?;
         if let Some(bp) = self.breakpoints.get_mut(&(pc as ptrace::AddressType)) && bp.is_enabled() {
             eprintln!("step over breakpoint");
             bp.disable()?;
             // registers::set_reg_value(self.pid, registers::Register::Rip, pc)?;
-            ptrace::step(self.tracee.pid, None)?;
-            self.tracee.wait_for_signal()?;
+            self.tracee.single_step_instr()?;
+            // ptrace::step(self.tracee.pid, None)?;
+            // self.tracee.wait_for_signal()?;
             bp.enable()?;
+
+            bp_present = true;
+        }
+
+        Ok(bp_present)
+    }
+
+    fn single_step_instr_with_breakpoint_check(&mut self) -> Result<()> {
+        if !self.step_over_breakpoint()? {
+            self.tracee.single_step_instr()?;
         }
 
         Ok(())
     }
+
+    // The return value specifies if the tracee has exited or not
+    // true => tracee has exited
+    // false => tracee is still alive
+    fn continue_execution(&mut self) -> Result<bool> {
+        self.step_over_breakpoint()?;
+        ptrace::cont(self.tracee.pid, None)?;
+        self.tracee.wait_for_signal()
+    }
+
+    fn step_in(&mut self) -> Result<()> {
+        let start_line_entry = self.tracee.get_line_entry()?;
+        while self.tracee.get_line_entry()? == start_line_entry {
+            self.single_step_instr_with_breakpoint_check()?;
+        }
+        Ok(())
+    }
+    
+    fn step_out(&mut self) -> Result<()> {
+        let fp = registers::get_reg_value(self.tracee.pid, registers::Register::Rbp)?;
+        let ret_addr = ptrace::read(self.tracee.pid, (fp+8) as ptrace::AddressType)?;
+        
+        let bp_later_action = if let Some(bp) = self.breakpoints.get_mut(&(ret_addr as ptrace::AddressType)) {
+            if bp.is_enabled() {
+                BreakpointLaterAction::Nothing
+            } else {
+                bp.enable()?;
+                BreakpointLaterAction::Disable
+            }
+        } else { 
+            BreakpointLaterAction::Delete
+        };
+
+        self.continue_execution()?;
+
+        self.reverse_breakpoint(ret_addr, bp_later_action)?;
+
+        Ok(())
+    }
+
+    fn step_over(&mut self) -> Result<()> {
+        // let func = dwarf::get_function_from_pc(self.tracee.load, pc);
+        Ok(())
+    }
+
+
+    fn reverse_breakpoint(&mut self, key: i64, action: BreakpointLaterAction) -> Result<()> {
+        match action {
+            BreakpointLaterAction::Nothing => {}
+            BreakpointLaterAction::Delete => {
+                let mut bp = self.breakpoints.remove(&(key as ptrace::AddressType)).unwrap();
+                bp.disable()?;
+            }
+            BreakpointLaterAction::Disable => {
+                let bp = self.breakpoints.get_mut(&(key as ptrace::AddressType)).unwrap();
+                bp.disable()?;
+            }
+            BreakpointLaterAction::Enable => {
+                let bp = self.breakpoints.get_mut(&(key as ptrace::AddressType)).unwrap();
+                bp.enable()?;
+            }
+        };
+
+        Ok(()) 
+    }
 }
+
