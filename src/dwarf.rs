@@ -47,8 +47,7 @@ pub(crate) fn load_dwarf<'o>(object: &'o object::File<'o>, endian: gimli::RunTim
 }
 
 // pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(Unit<R, <R as gimli::Reader>::Offset>, UnitOffset<<R as gimli::Reader>::Offset>)>> {
-// pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(Unit<R>, UnitOffset<<R as gimli::Reader>::Offset>)>> {
-pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<()>> {
+pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(Unit<R>, UnitOffset<<R as gimli::Reader>::Offset>)>> {
     if let Some(unit) = get_compile_unit_for_pc(dwarf, pc)? {
         let mut depth = 0; 
 
