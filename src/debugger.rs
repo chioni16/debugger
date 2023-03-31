@@ -1,36 +1,27 @@
 use anyhow::{Result, anyhow};
-use nix::sys::{wait, ptrace};
-use std::{io::stdin, collections::HashMap};
+use nix::sys::ptrace;
+use std::io::{stdin, Read};
+use std::collections::HashMap;
 
-use crate::{breakpoint::Breakpoint, registers};
+use crate::{breakpoint::Breakpoint, registers, tracee::Tracee, util};
 
 pub struct Debugger {
-    t_pid: nix::unistd::Pid,
+    tracee: Tracee,
     breakpoints: HashMap<ptrace::AddressType, Breakpoint>,
 }
 
 impl Debugger {
-    pub fn new(t_pid: nix::unistd::Pid) -> Self {
-        Self {  
-            t_pid,
+    pub fn new(path: &str) -> Result<Self> {
+        let debugger = Self {  
+            tracee: Tracee::new(path)?,
             breakpoints: HashMap::new(),
-        }
-    }
-
-    pub fn set_breakpoint_at(&mut self, addr: ptrace::AddressType) -> Result<()> {
-        let mut bp = Breakpoint::new(self.t_pid, addr);
-        bp.enable()?;
-
-        self.breakpoints.insert(addr, bp);
-
-        Ok(())
+        };
+        Ok(debugger)
     }
 
     pub fn run(&mut self) -> Result<()> {
         let mut buffer = String::new();
-        if matches!(wait::waitpid(self.t_pid, None)?, wait::WaitStatus::Exited(_, _)) {
-            return Ok(());
-        }
+        if self.tracee.wait_for_signal()? { return Ok(()) }
         loop {
             eprint!("> ");
             buffer.clear();
@@ -39,48 +30,47 @@ impl Debugger {
             let mut split = buffer.trim_end().split(' ');
             match split.next().ok_or(anyhow!("Empty command"))? {
                 "b" | "break"             => {
-                    let addr = parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
+                    let addr = util::parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
+                    let addr = addr + self.tracee.start_load_addr;
                     self.set_breakpoint_at(addr as ptrace::AddressType)?;
                 }
                 "c" | "cont" | "continue" => {
                     self.step_over_breakpoint()?;
-                    ptrace::cont(self.t_pid, None)?;
-                    if matches!(wait::waitpid(self.t_pid, None)?, wait::WaitStatus::Exited(_, _)) {
-                        break;
-                    }
+                    ptrace::cont(self.tracee.pid, None)?;
+                    if self.tracee.wait_for_signal()? { break }
                 }
                 "r" | "reg" | "registers" => {
                     let sc = split.next().ok_or(anyhow!("No subcommand provided"))?;
                     match sc {
-                        "dump" => {
-                            let regs = ptrace::getregs(self.t_pid)?;
+                        "d" | "dump" => {
+                            let regs = ptrace::getregs(self.tracee.pid)?;
                             println!("REGS: {:?}", regs);
                         }
-                        "read" => {
+                        "r" | "read" => {
                             let reg = split.next().ok_or(anyhow!("No register provided"))?;
                             let reg = registers::get_reg_from_string(reg)?;
-                            println!("{:#x}", registers::get_reg_value(self.t_pid, reg)?);
+                            println!("{:#x}", registers::get_reg_value(self.tracee.pid, reg)?);
                         }
-                        "write" => {
+                        "w" | "write" => {
                             let reg = split.next().ok_or(anyhow!("No register provided"))?;
                             let reg = registers::get_reg_from_string(reg)?;
-                            let value = parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?; 
-                            registers::set_reg_value(self.t_pid, reg, value as u64)?;
+                            let value = util::parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?; 
+                            registers::set_reg_value(self.tracee.pid, reg, value as u64)?;
                         }
                         _ => return Err(anyhow!("Unknown subcommand: {}", sc)),
                     }
                 }
                 "m" | "mem" | "memory" => {
                     let sc = split.next().ok_or(anyhow!("No subcommand provided"))?;
-                    let addr = parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
+                    let addr = util::parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
                     match sc {
-                        "read" => {
-                            let val = ptrace::read(self.t_pid, addr as ptrace::AddressType)?;
+                        "r" | "read" => {
+                            let val = ptrace::read(self.tracee.pid, addr as ptrace::AddressType)?;
                             println!("{:#x}", val);
                         }
-                        "write" => {
-                            let val = parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?;
-                            unsafe { ptrace::write(self.t_pid, addr as ptrace::AddressType, val as ptrace::AddressType)?; }
+                        "w" | "write" => {
+                            let val = util::parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?;
+                            unsafe { ptrace::write(self.tracee.pid, addr as ptrace::AddressType, val as ptrace::AddressType)?; }
                         }
                         _ => return Err(anyhow!("Unknown subcommand: {}", sc)),
                     }
@@ -91,27 +81,30 @@ impl Debugger {
 
         Ok(())
     }
+}
+
+impl Debugger {
+    fn set_breakpoint_at(&mut self, addr: ptrace::AddressType) -> Result<()> {
+        let mut bp = Breakpoint::new(self.tracee.pid, addr);
+        bp.enable()?;
+        println!("bp: {:?}", bp);
+        self.breakpoints.insert(addr, bp);
+
+        Ok(())
+    }
 
     fn step_over_breakpoint(&mut self) -> Result<()> {
-        let pc = registers::get_reg_value(self.t_pid, registers::Register::Rip)? - 1;
+        // let pc = registers::get_reg_value(self.pid, registers::Register::Rip)? - 1;
+        let pc = registers::get_reg_value(self.tracee.pid, registers::Register::Rip)?;
         if let Some(bp) = self.breakpoints.get_mut(&(pc as ptrace::AddressType)) && bp.is_enabled() {
             eprintln!("step over breakpoint");
             bp.disable()?;
-            registers::set_reg_value(self.t_pid, registers::Register::Rip, pc)?;
-            ptrace::step(self.t_pid, None)?;
-            wait::waitpid(self.t_pid, None)?;
+            // registers::set_reg_value(self.pid, registers::Register::Rip, pc)?;
+            ptrace::step(self.tracee.pid, None)?;
+            self.tracee.wait_for_signal()?;
             bp.enable()?;
         }
 
         Ok(())
     }
-
-}
-
-fn parse_hex(val: &str) -> Result<i64> {
-    if &val[..2] != "0x" {
-        return Err(anyhow!("Pass hexadecimal values starting with 0x"));
-    }
-    let val = i64::from_str_radix(&val[2..], 16)?;
-    Ok(val)
 }
