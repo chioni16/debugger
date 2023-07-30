@@ -1,13 +1,12 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use nix::sys::ptrace;
-use std::io::{stdin, Read};
 use std::collections::HashMap;
+use std::io::stdin;
 
-use crate::dwarf;
 use crate::{
-    breakpoint::{Breakpoint, BreakpointLaterAction}, 
-    registers, 
-    tracee::Tracee, 
+    breakpoint::{Breakpoint, BreakpointLaterAction},
+    dwarf, registers,
+    tracee::Tracee,
     util,
 };
 
@@ -18,7 +17,7 @@ pub struct Debugger {
 
 impl Debugger {
     pub fn new(path: &str) -> Result<Self> {
-        let debugger = Self {  
+        let debugger = Self {
             tracee: Tracee::new(path)?,
             breakpoints: HashMap::new(),
         };
@@ -27,7 +26,9 @@ impl Debugger {
 
     pub fn run(&mut self) -> Result<()> {
         let mut buffer = String::new();
-        if self.tracee.wait_for_signal()? { return Ok(()) }
+        if self.tracee.wait_for_signal()? {
+            return Ok(());
+        }
         loop {
             eprint!("> ");
             buffer.clear();
@@ -35,22 +36,28 @@ impl Debugger {
 
             let mut split = buffer.trim_end().split(' ');
             match split.next().ok_or(anyhow!("Empty command"))? {
-                "b" | "break"             => {
-                    let addr = util::parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
-                    let addr = addr + self.tracee.start_load_addr;
+                "b" | "break" => {
+                    let addr =
+                        util::parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
+                    // let addr = addr + self.tracee.start_load_addr;
+                    let addr = self.tracee.add_load_addr(addr);
                     self.set_breakpoint_at(addr as ptrace::AddressType)?;
                 }
-                "c" | "cont" | "continue" => if self.continue_execution()? { break },
-                "si" | "stepi" => {
-                    self.single_step_instr_with_breakpoint_check()?;
-                    self.tracee.print_source()?;
+                "c" | "cont" | "continue" => {
+                    if self.continue_execution()? {
+                        break;
+                    }
                 }
+                "si" | "stepi" => self.single_step_instr_with_breakpoint_check()?,
+                "step" => self.step_in()?,
+                "next" => self.step_over()?,
+                "finish" => self.step_out()?,
                 "r" | "reg" | "registers" => {
                     let sc = split.next().ok_or(anyhow!("No subcommand provided"))?;
                     match sc {
                         "d" | "dump" => {
                             let regs = ptrace::getregs(self.tracee.pid)?;
-                            println!("REGS: {:?}", regs);
+                            println!("REGS: {:#x?}", regs);
                         }
                         "r" | "read" => {
                             let reg = split.next().ok_or(anyhow!("No register provided"))?;
@@ -60,7 +67,8 @@ impl Debugger {
                         "w" | "write" => {
                             let reg = split.next().ok_or(anyhow!("No register provided"))?;
                             let reg = registers::get_reg_from_string(reg)?;
-                            let value = util::parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?; 
+                            let value =
+                                util::parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?;
                             registers::set_reg_value(self.tracee.pid, reg, value as u64)?;
                         }
                         _ => return Err(anyhow!("Unknown subcommand: {}", sc)),
@@ -68,7 +76,8 @@ impl Debugger {
                 }
                 "m" | "mem" | "memory" => {
                     let sc = split.next().ok_or(anyhow!("No subcommand provided"))?;
-                    let addr = util::parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
+                    let addr =
+                        util::parse_hex(split.next().ok_or(anyhow!("No address provided"))?)?;
                     match sc {
                         "r" | "read" => {
                             let val = self.tracee.read_mem(addr)?;
@@ -76,13 +85,15 @@ impl Debugger {
                             println!("{:#x}", val);
                         }
                         "w" | "write" => {
-                            let val = util::parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?;
+                            let val =
+                                util::parse_hex(split.next().ok_or(anyhow!("No value provided"))?)?;
                             self.tracee.write_mem(addr, val)?;
                             // unsafe { ptrace::write(self.tracee.pid, addr as ptrace::AddressType, val as ptrace::AddressType)?; }
                         }
                         _ => return Err(anyhow!("Unknown subcommand: {}", sc)),
                     }
                 }
+                "l" | "lines" => self.tracee.print_source()?,
                 cmd => return Err(anyhow!("Empty / Unknown command: {}", cmd)),
             };
         }
@@ -99,6 +110,24 @@ impl Debugger {
         self.breakpoints.insert(addr, bp);
 
         Ok(())
+    }
+
+    fn set_temp_breakpoint_at(
+        &mut self,
+        addr: ptrace::AddressType,
+    ) -> Result<BreakpointLaterAction> {
+        let la = if let Some(bp) = self.breakpoints.get_mut(&addr) {
+            if bp.is_enabled() {
+                BreakpointLaterAction::Nothing
+            } else {
+                bp.enable()?;
+                BreakpointLaterAction::Disable
+            }
+        } else {
+            self.set_breakpoint_at(addr)?;
+            BreakpointLaterAction::Delete
+        };
+        Ok(la)
     }
 
     fn step_over_breakpoint(&mut self) -> Result<bool> {
@@ -144,53 +173,93 @@ impl Debugger {
         }
         Ok(())
     }
-    
+
     fn step_out(&mut self) -> Result<()> {
         let fp = registers::get_reg_value(self.tracee.pid, registers::Register::Rbp)?;
-        let ret_addr = ptrace::read(self.tracee.pid, (fp+8) as ptrace::AddressType)?;
-        
-        let bp_later_action = if let Some(bp) = self.breakpoints.get_mut(&(ret_addr as ptrace::AddressType)) {
-            if bp.is_enabled() {
-                BreakpointLaterAction::Nothing
-            } else {
-                bp.enable()?;
-                BreakpointLaterAction::Disable
-            }
-        } else { 
-            BreakpointLaterAction::Delete
-        };
+        let ret_addr = ptrace::read(self.tracee.pid, (fp + 8) as ptrace::AddressType)?;
+
+        let la = self.set_temp_breakpoint_at(ret_addr as ptrace::AddressType)?;
 
         self.continue_execution()?;
 
-        self.reverse_breakpoint(ret_addr, bp_later_action)?;
+        self.reverse_breakpoint(ret_addr as ptrace::AddressType, la)?;
 
         Ok(())
     }
 
     fn step_over(&mut self) -> Result<()> {
-        // let func = dwarf::get_function_from_pc(self.tracee.load, pc);
+        println!("start of step over");
+        let (unit, offset) = self
+            .tracee
+            .get_func()?
+            .ok_or(anyhow!("Currently not in a function defined in the binary"))?;
+        let func = unit.entry(offset)?;
+        println!("found function");
+
+        let func_range = dwarf::get_die_addr_range(&func)?;
+        let func_start_line =
+            dwarf::get_line_entry_from_pc(&self.tracee.load_dwarf()?, func_range.start)?
+                .ok_or(anyhow!("Func start not found"))?;
+        let func_end_line =
+            dwarf::get_line_entry_from_pc(&self.tracee.load_dwarf()?, func_range.end)?
+                .ok_or(anyhow!("Func end not found"))?;
+        let start_line = self
+            .tracee
+            .get_line_entry()?
+            .ok_or(anyhow!("Start line not found"))?;
+        println!("found function lines:\nfunc_start_line: {:#?}\nfunc_end_line: {:#?}\nstart_line: {:#?}\n", func_start_line, func_end_line, start_line);
+
+        let lines = dwarf::get_lines_for_unit(&unit)?;
+        println!("lines: {:#?}", lines);
+        let mut addrs = (func_start_line.line..=func_end_line.line)
+            .into_iter()
+            .filter(|line_no| *line_no != start_line.line)
+            .filter_map(|ref line_no| {
+                println!("line_no: {}", line_no);
+                lines.get(line_no)
+                .map(|addr| {
+                    let addr = self.tracee.add_load_addr(*addr as u64) as ptrace::AddressType;
+                    self.set_temp_breakpoint_at(addr).map(|la| (addr, la))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        println!("addrs: {:#?}", addrs);
+
+        let fp = registers::get_reg_value(self.tracee.pid, registers::Register::Rbp)?;
+        let ret_addr = ptrace::read(self.tracee.pid, (fp + 8) as ptrace::AddressType)?;
+        let rla = self.set_temp_breakpoint_at(ret_addr as ptrace::AddressType)?;
+        addrs.push((ret_addr as ptrace::AddressType, rla));
+
+        self.continue_execution()?;
+
+        for (addr, la) in addrs {
+            self.reverse_breakpoint(addr, la)?;
+        }
+
         Ok(())
     }
 
-
-    fn reverse_breakpoint(&mut self, key: i64, action: BreakpointLaterAction) -> Result<()> {
+    fn reverse_breakpoint(
+        &mut self,
+        key: ptrace::AddressType,
+        action: BreakpointLaterAction,
+    ) -> Result<()> {
         match action {
             BreakpointLaterAction::Nothing => {}
             BreakpointLaterAction::Delete => {
-                let mut bp = self.breakpoints.remove(&(key as ptrace::AddressType)).unwrap();
+                let mut bp = self.breakpoints.remove(&key).unwrap();
                 bp.disable()?;
             }
             BreakpointLaterAction::Disable => {
-                let bp = self.breakpoints.get_mut(&(key as ptrace::AddressType)).unwrap();
+                let bp = self.breakpoints.get_mut(&key).unwrap();
                 bp.disable()?;
             }
             BreakpointLaterAction::Enable => {
-                let bp = self.breakpoints.get_mut(&(key as ptrace::AddressType)).unwrap();
+                let bp = self.breakpoints.get_mut(&key).unwrap();
                 bp.enable()?;
             }
         };
 
-        Ok(()) 
+        Ok(())
     }
 }
-

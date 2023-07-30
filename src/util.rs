@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::io::{BufRead, BufReader};
 
 pub fn parse_hex(val: &str) -> Result<u64> {
@@ -10,8 +10,19 @@ pub fn parse_hex(val: &str) -> Result<u64> {
 }
 
 pub fn print_source(path: impl AsRef<str>, n_line: usize, n_lines_context: usize) -> Result<()> {
-    let start = if n_line <= n_lines_context { 1 } else { n_line - n_lines_context };
-    let end = n_line + n_lines_context + if n_line < n_lines_context { n_lines_context - n_line } else { 0 } + 1; 
+    let start = if n_line <= n_lines_context {
+        1
+    } else {
+        n_line - n_lines_context
+    };
+    let end = n_line
+        + n_lines_context
+        + if n_line < n_lines_context {
+            n_lines_context - n_line
+        } else {
+            0
+        }
+        + 1;
 
     for (i, line) in get_file_lines(path.as_ref())?.enumerate() {
         if i < start {
@@ -20,7 +31,7 @@ pub fn print_source(path: impl AsRef<str>, n_line: usize, n_lines_context: usize
         if i > end {
             break;
         }
-        eprint!("{}", if i == n_line {"> "} else {"  "});
+        eprint!("{}", if i == n_line { "> " } else { "  " });
         eprintln!("{}", line?);
     }
 

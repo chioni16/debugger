@@ -1,6 +1,6 @@
-use anyhow::{Result, anyhow};
-use nix::sys::ptrace;
+use anyhow::{anyhow, Result};
 use nix::libc;
+use nix::sys::ptrace;
 use nix::unistd::Pid;
 
 #[allow(dead_code)]
@@ -92,7 +92,7 @@ pub fn get_reg_from_string(s: &str) -> Result<Register> {
         "ds" => Register::Ds,
         "es" => Register::Es,
 
-        _    => return Err(anyhow!("Unrecognised register: {}", s)),
+        _ => return Err(anyhow!("Unrecognised register: {}", s)),
     };
 
     Ok(reg)
@@ -110,8 +110,8 @@ pub fn get_dwarf_number_from_reg(reg: Register) -> Option<u8> {
         Register::Rbp => 6,
         Register::Rsp => 7,
 
-        Register::R8  => 8,
-        Register::R9  => 9,
+        Register::R8 => 8,
+        Register::R9 => 9,
         Register::R10 => 10,
         Register::R11 => 11,
 
@@ -139,26 +139,26 @@ pub fn get_dwarf_number_from_reg(reg: Register) -> Option<u8> {
 
 pub fn get_reg_from_dwarf_number(dwarf: u8) -> Result<Register> {
     let reg = match dwarf {
-        0 => Register::Rax, 
-        3 => Register::Rbx, 
-        2 => Register::Rcx, 
-        1 => Register::Rdx, 
+        0 => Register::Rax,
+        3 => Register::Rbx,
+        2 => Register::Rcx,
+        1 => Register::Rdx,
 
         5 => Register::Rdi,
         4 => Register::Rsi,
         6 => Register::Rbp,
         7 => Register::Rsp,
-        
-        8  => Register::R8,
-        9  => Register::R9,
+
+        8 => Register::R8,
+        9 => Register::R9,
         10 => Register::R10,
         11 => Register::R11,
-            
+
         12 => Register::R12,
         13 => Register::R13,
         14 => Register::R14,
         15 => Register::R15,
-            
+
         // Register::Rip = 255,
         49 => Register::Rflags,
         51 => Register::Cs,
@@ -173,7 +173,12 @@ pub fn get_reg_from_dwarf_number(dwarf: u8) -> Result<Register> {
         53 => Register::Ds,
         50 => Register::Es,
 
-        _  => return Err(anyhow!("Received unsupported dwarf register number: {}", dwarf)), 
+        _ => {
+            return Err(anyhow!(
+                "Received unsupported dwarf register number: {}",
+                dwarf
+            ))
+        }
     };
     Ok(reg)
 }

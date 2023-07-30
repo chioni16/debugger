@@ -1,9 +1,14 @@
-use std::{ops::Range, path::PathBuf};
+use std::collections::HashMap;
 use std::path;
+use std::{ops::Range, path::PathBuf};
 
-use gimli::{Dwarf, EndianSlice, RunTimeEndian, read::{Unit, UnitOffset, DebuggingInformationEntry}};
+use anyhow::{anyhow, Result};
+use gimli::{
+    read::{DebuggingInformationEntry, Unit, UnitOffset},
+    Dwarf, EndianSlice, RunTimeEndian,
+};
+use nix::sys::ptrace;
 use object::{Object, ObjectSection};
-use anyhow::Result;
 
 // #[allow(unused)]
 // pub fn runner() {
@@ -23,41 +28,46 @@ use anyhow::Result;
 //     println!("line entry from pc: {:x?}", get_line_entry_from_pc(&dwarf, 0x1150).unwrap());
 // }
 
-pub(crate) fn load_dwarf<'o>(object: &'o object::File<'o>, endian: gimli::RunTimeEndian) -> Result<Dwarf<EndianSlice<'o, RunTimeEndian>>, gimli::Error> {
-// pub(crate) fn load_dwarf<'o, R: gimli::Reader>(object: &'o object::File<'o>, endian: gimli::RunTimeEndian) -> Result<Dwarf<impl gimli::Reader + 'o>, gimli::Error> {
-    let load_section = |id: gimli::SectionId| -> Result<gimli::EndianSlice<RunTimeEndian>, gimli::Error> {
-        match object.section_by_name(id.name()) {
-            Some(ref section) => {
-                let section = section
-                .data()
-                .unwrap_or(&[][..]);
-                let section = gimli::EndianSlice::new(section, endian);
-                Ok(section)
+pub(crate) fn load_dwarf<'o>(
+    object: &'o object::File<'o>,
+    endian: gimli::RunTimeEndian,
+) -> Result<Dwarf<EndianSlice<'o, RunTimeEndian>>, gimli::Error> {
+    // pub(crate) fn load_dwarf<'o, R: gimli::Reader>(object: &'o object::File<'o>, endian: gimli::RunTimeEndian) -> Result<Dwarf<impl gimli::Reader + 'o>, gimli::Error> {
+    let load_section =
+        |id: gimli::SectionId| -> Result<gimli::EndianSlice<RunTimeEndian>, gimli::Error> {
+            match object.section_by_name(id.name()) {
+                Some(ref section) => {
+                    let section = section.data().unwrap_or(&[][..]);
+                    let section = gimli::EndianSlice::new(section, endian);
+                    Ok(section)
+                }
+                None => {
+                    let section = &[][..];
+                    let section = gimli::EndianSlice::new(&*section, endian);
+                    Ok(section)
+                }
             }
-            None => {
-                let section = &[][..];
-                let section = gimli::EndianSlice::new(&*section, endian);
-                Ok(section)
-            }
-        }
-    };
+        };
 
     let d = gimli::Dwarf::load(&load_section)?;
     Ok(d)
 }
 
-// pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(Unit<R, <R as gimli::Reader>::Offset>, UnitOffset<<R as gimli::Reader>::Offset>)>> {
-pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<(Unit<R>, UnitOffset<<R as gimli::Reader>::Offset>)>> {
+pub fn get_function_from_pc<R: gimli::Reader>(
+    dwarf: &Dwarf<R>,
+    pc: u64,
+) -> Result<Option<(Unit<R>, UnitOffset<<R as gimli::Reader>::Offset>)>> {
     if let Some(unit) = get_compile_unit_for_pc(dwarf, pc)? {
-        let mut depth = 0; 
+        // let mut depth = 0;
 
         let mut entries = unit.entries();
-        while let Some((delta_depth, entry)) = entries.next_dfs()? {
-            depth += delta_depth;
-            if matches!(entry.tag(), gimli::DW_TAG_subprogram) && get_die_addr_range(entry)?.contains(&pc) { 
-                let offset =  entry.offset().to_owned();
-                // return Ok(Some((unit, offset)))
-                return Ok(Some(()))
+        while let Some((_delta_depth, entry)) = entries.next_dfs()? {
+            // depth += delta_depth;
+            if matches!(entry.tag(), gimli::DW_TAG_subprogram)
+                && get_die_addr_range(entry)?.contains(&pc)
+            {
+                let offset = entry.offset().to_owned();
+                return Ok(Some((unit, offset)));
             }
         }
     }
@@ -65,10 +75,13 @@ pub fn get_function_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Resu
     Ok(None)
 }
 
-pub fn get_line_entry_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<LineEntry>> {
+pub fn get_line_entry_from_pc<R: gimli::Reader>(
+    dwarf: &Dwarf<R>,
+    pc: u64,
+) -> Result<Option<LineEntry>> {
     let mut value = None;
 
-    if let Some(unit) = get_compile_unit_for_pc(dwarf, pc)? 
+    if let Some(unit) = get_compile_unit_for_pc(dwarf, pc)?
     && let Some(program) = unit.line_program.clone()
     {
         let comp_dir = if let Some(ref dir) = unit.comp_dir {
@@ -113,8 +126,9 @@ pub fn get_line_entry_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Re
             } as usize;
 
             value = Some(LineEntry {
-                path, 
-                line, 
+                addr: row.address(),
+                path,
+                line,
                 col,
             });
         }
@@ -123,26 +137,48 @@ pub fn get_line_entry_from_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Re
     Ok(value)
 }
 
-pub fn get_compile_unit_for_pc<R: gimli::Reader>(dwarf: &Dwarf<R>, pc: u64) -> Result<Option<gimli::Unit<R>>> {
+pub fn get_compile_unit_for_pc<R: gimli::Reader>(
+    dwarf: &Dwarf<R>,
+    pc: u64,
+) -> Result<Option<gimli::Unit<R>>> {
     let mut iter = dwarf.units();
     while let Some(header) = iter.next()? {
         let unit = dwarf.unit(header)?;
         let mut entries = unit.entries();
 
-        if let Some((_, cu)) = entries.next_dfs()? 
-        && matches!(cu.tag(), gimli::DW_TAG_compile_unit) 
+        if let Some((_, cu)) = entries.next_dfs()?
+        && matches!(cu.tag(), gimli::DW_TAG_compile_unit)
         && get_die_addr_range(cu)?.contains(&pc)
         {
-            return Ok(Some(unit)); 
+            return Ok(Some(unit));
         }
     }
     Ok(None)
 }
 
-fn get_die_addr_range<R: gimli::Reader>(entry: &DebuggingInformationEntry<R>) -> Result<Range<u64>> {
+pub fn get_die_addr_range<R: gimli::Reader>(
+    entry: &DebuggingInformationEntry<R>,
+) -> Result<Range<u64>> {
     let gimli::AttributeValue::Addr(low_pc)   = entry.attr_value(gimli::DW_AT_low_pc)?.unwrap() else {unreachable!()};
     let gimli::AttributeValue::Udata(high_pc) = entry.attr_value(gimli::DW_AT_high_pc)?.unwrap() else {unreachable!()};
-    Ok(low_pc..low_pc+high_pc)
+    Ok(low_pc..low_pc + high_pc)
+}
+
+pub fn get_lines_for_unit<R: gimli::Reader>(
+    unit: &Unit<R>,
+) -> Result<HashMap<usize, ptrace::AddressType>> {
+    let mut lines = HashMap::new();
+    let mut rows = unit
+        .line_program
+        .clone()
+        .ok_or(anyhow!("Function lines not found"))?
+        .rows();
+    while let Some((_, row)) = rows.next_row()? {
+        let line = row.line().unwrap().get();
+        let addr = row.address();
+        lines.insert(line as usize, addr as ptrace::AddressType);
+    }
+    Ok(lines)
 }
 
 fn print_die_attrs<R: gimli::Reader>(entry: &DebuggingInformationEntry<R>) -> Result<()> {
@@ -155,6 +191,7 @@ fn print_die_attrs<R: gimli::Reader>(entry: &DebuggingInformationEntry<R>) -> Re
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct LineEntry {
+    pub addr: u64,
     pub path: PathBuf,
     pub line: usize,
     pub col: usize,
